@@ -6,6 +6,15 @@ info:
     Complete interface contract of Synq V1 (specification Section 6, 6.1-6.6): public REST API,
     the two WebSocket protocols, internal service API, health endpoints and broker events.
 
+    ## Implementation scope
+    The database, broker, cache and object-storage products in this specification (including PostgreSQL,
+    RabbitMQ, Redis and S3-compatible storage) are examples for the reference deployment, not mandatory vendors.
+    Equivalent products are permitted if all functional, reliability, security and consistency requirements hold.
+
+    Workspace roles are OWNER, ADMINISTRATOR and MEMBER. There is no separate channel-specific management role.
+    Only a workspace OWNER or ADMINISTRATOR may create, rename or archive channels and manage private-channel
+    participants. Only the OWNER may assign or remove ADMINISTRATOR roles.
+
     ## Common REST conventions
     | Topic | Rule |
     |---|---|
@@ -50,7 +59,6 @@ info:
     | ALREADY_MEMBER | 409 | Already a workspace member |
     | INVITATION_USED / INVITATION_EXPIRED / INVITATION_REVOKED | 409 | Invitation can no longer be used |
     | OWNER_MUST_TRANSFER | 409 | Owner tried to leave or be removed |
-    | MANAGER_CANNOT_LEAVE | 409 | Only manager of a private channel tried to leave |
     | EDIT_CONFLICT | 409 | Message changed since `expectedEditVersion` |
     | FILE_NOT_READY | 409 | File still uploading or failed |
     | FILE_ATTACHED | 409 | Attached file cannot be cancelled |
@@ -86,7 +94,9 @@ info:
     - Gateway: 10 s per request (60 s uploads) → 504; no healthy instance → 503 + `Retry-After: 5`.
     - Clients retry 5xx/network errors only for idempotent requests or with the same idempotency key; 429 after `Retry-After`; never other 4xx. UI shows the action as failed, not saved (NFR-014).
 
-    ## Broker (RabbitMQ) and events
+    ## Broker and events (RabbitMQ reference example)
+    The queue/exchange names below describe the reference deployment. Any broker with equivalent reliable
+    delivery, acknowledgement, at-least-once retry, deduplication and live fan-out semantics is acceptable.
     | Element | Configuration | Purpose |
     |---|---|---|
     | Exchange `synq.events` | topic, durable, routing key = eventType | All domain events, published via outbox |
@@ -441,7 +451,8 @@ paths:
     patch:
       tags: [Workspaces]
       operationId: changeMemberRole
-      summary: Change role between MEMBER and ADMINISTRATOR (FR-006)
+      summary: Workspace Owner assigns/removes ADMINISTRATOR role (FR-006)
+      description: Only the workspace OWNER may change a MEMBER to ADMINISTRATOR or back. An ADMINISTRATOR cannot assign or remove other administrators, including themselves. Ownership transfer uses the dedicated endpoint.
       requestBody:
         required: true
         content:
@@ -460,7 +471,8 @@ paths:
     delete:
       tags: [Workspaces]
       operationId: removeMember
-      summary: Remove a member, or leave when userId is the caller (FR-007)
+      summary: Remove a workspace member or leave the workspace (FR-007)
+      description: Any non-OWNER workspace user may leave their own workspace. An ADMINISTRATOR may remove MEMBERs only; only the OWNER may remove an ADMINISTRATOR. The OWNER cannot leave without transferring ownership first. Revocation removes all channel and document access.
       responses:
         '204': { description: Membership removed; access revoked. }
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -597,7 +609,8 @@ paths:
     post:
       tags: [Channels]
       operationId: createChannel
-      summary: Create a channel; creator becomes channel manager (FR-009)
+      summary: Owner/Administrator creates a public or private channel (FR-009)
+      description: Requires workspace OWNER or ADMINISTRATOR. No channel-specific management role is created. A public channel may be joined by any workspace member; private-channel participation is managed by the workspace OWNER or ADMINISTRATOR.
       requestBody:
         required: true
         content:
@@ -664,8 +677,8 @@ paths:
     patch:
       tags: [Channels]
       operationId: updateChannel
-      summary: Rename or archive a channel (FR-009, FR-019)
-      description: Archiving is permanent in V1; archived=false returns 422 UNARCHIVE_NOT_SUPPORTED. Renaming an archived channel returns 403 CHANNEL_ARCHIVED.
+      summary: Owner/Administrator renames or archives a channel (FR-009, FR-019)
+      description: Requires workspace OWNER or ADMINISTRATOR. Archiving is permanent in V1; archived=false returns 422 UNARCHIVE_NOT_SUPPORTED. Renaming an archived channel returns 403 CHANNEL_ARCHIVED.
       requestBody:
         required: true
         content:
@@ -704,7 +717,8 @@ paths:
     post:
       tags: [Channels]
       operationId: addChannelParticipant
-      summary: Join a public channel (own userId) or add a member to a private channel (FR-009, FR-010)
+      summary: Join a public channel or manage private-channel participants (FR-009, FR-010)
+      description: Any workspace user (OWNER, ADMINISTRATOR or MEMBER) may add only themselves to a PUBLIC channel. Only workspace OWNER or ADMINISTRATOR may add a workspace member to a PRIVATE channel. There is no independent channel-management permission.
       requestBody:
         required: true
         content:
@@ -736,7 +750,8 @@ paths:
     delete:
       tags: [Channels]
       operationId: removeChannelParticipant
-      summary: Leave a channel (self) or remove a participant from a private channel (FR-010)
+      summary: Leave a channel or remove a private-channel participant (FR-010)
+      description: A channel participant may remove only themselves; only workspace OWNER or ADMINISTRATOR may remove someone else from a PRIVATE channel. There is no manager handoff or special channel-leaving restriction.
       responses:
         '204': { description: Removed; live subscriptions closed within 5 s. }
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -1459,7 +1474,7 @@ paths:
         | Dir | type | Payload schema | Behaviour |
         |---|---|---|---|
         | C→S | `sync.request` | WsSyncRequest | First frame, and whenever updates may be missing |
-        | S→C | `sync.response` | WsSyncResponse | Everything the client lacks; client then sends one `update` with what the server lacks |
+        | S→C | `sync.response` | WsSyncResponse | Missing server state; client applies it and retries preserved pending updates with their original `updateId` |
         | C→S | `update` | WsDocUpdate | Local edit; at most one per 50 ms |
         | S→C | `update.ack` | WsUpdateAck | Only after commit + outbox (NFR-005) |
         | S→C | `update.rejected` | WsUpdateRejected | READ_ONLY, DOCUMENT_TOO_LARGE, MALFORMED_UPDATE, ACCESS_REVOKED |
@@ -1478,8 +1493,10 @@ paths:
         Server sets `userId`, `displayName`, `color` (8 fixed colours by join order) — never trusted from client.
 
         **Client rules:** keep unacknowledged updates pending and show "Saved" / "Saving…" / "Offline – changes not saved".
-        No ack in 5 s while connected → resend same `updateId`. After reconnect: `sync.request`, apply response, send one
-        new `update` with everything the server lacks (no replay of the pending list). On DOCUMENT_TOO_LARGE /
+        No ack in 5 s while connected → resend same `updateId`. After reconnect: `sync.request`, apply the server
+        response, then retry each preserved pending update with its original `updateId` (idempotent even if committed).
+        If local edits have no preserved update frame, send one Yjs state-vector diff with a new `updateId` instead;
+        never submit both forms for the same pending edit. On DOCUMENT_TOO_LARGE /
         MALFORMED_UPDATE: show rejected text as unsent, discard local `Y.Doc`, resync from empty. Gap in `update.remote`
         `seq` → `sync.request`. Editor without awareness/heartbeat for 15 s is removed (FR-034).
 
@@ -1550,7 +1567,8 @@ paths:
           required: true
           schema:
             type: string
-            enum: [workspace.read, workspace.manage-members, workspace.transfer-ownership, channel.read, channel.write, channel.manage, message.moderate]
+            enum: [workspace.read, workspace.manage-members, workspace.manage-administrators, workspace.transfer-ownership, channel.read, channel.write, channel.manage, message.moderate]
+          description: workspace.manage-members is available to OWNER/ADMINISTRATOR for invitations and MEMBER removals; workspace.manage-administrators and workspace.transfer-ownership are OWNER-only. channel.manage is permitted only to OWNER/ADMINISTRATOR; public channel self-join is handled separately.
       responses:
         '200':
           description: Decision.
@@ -1562,7 +1580,6 @@ paths:
                 properties:
                   allowed: { type: boolean }
                   workspaceRole: { $ref: '#/components/schemas/WorkspaceRole' }
-                  isChannelManager: { type: boolean }
                   channelArchived: { type: boolean }
 
   /internal/v1/workspaces/{workspaceId}/users/{userId}/channel-ids:
@@ -1874,7 +1891,7 @@ components:
     Conflict:
       description: |
         Uniqueness or state conflict: EMAIL_TAKEN, CHANNEL_NAME_TAKEN, ALREADY_MEMBER, INVITATION_USED,
-        INVITATION_EXPIRED, INVITATION_REVOKED, OWNER_MUST_TRANSFER, MANAGER_CANNOT_LEAVE, EDIT_CONFLICT,
+        INVITATION_EXPIRED, INVITATION_REVOKED, OWNER_MUST_TRANSFER, EDIT_CONFLICT,
         FILE_NOT_READY, FILE_ATTACHED.
       content:
         application/json:
@@ -2145,6 +2162,7 @@ components:
           description: Only true is accepted.
     ChannelAccess:
       type: object
+      description: canManage is true only for the workspace OWNER or ADMINISTRATOR. It is not a channel-specific role.
       required: [isParticipant, canRead, canWrite, canManage]
       properties:
         isParticipant: { type: boolean }
@@ -2153,7 +2171,7 @@ components:
         canManage: { type: boolean }
     Channel:
       type: object
-      required: [id, workspaceId, name, visibility, archived, managerUserId, participantCount, createdAtUtc, myAccess]
+      required: [id, workspaceId, name, visibility, archived, participantCount, createdAtUtc, myAccess]
       properties:
         id: { type: string, format: uuid }
         workspaceId: { type: string, format: uuid }
@@ -2161,7 +2179,6 @@ components:
         visibility: { $ref: '#/components/schemas/ChannelVisibility' }
         archived: { type: boolean }
         archivedAtUtc: { type: string, format: date-time, nullable: true }
-        managerUserId: { type: string, format: uuid }
         participantCount: { type: integer, minimum: 0 }
         createdAtUtc: { type: string, format: date-time }
         myAccess: { $ref: '#/components/schemas/ChannelAccess' }
@@ -2176,12 +2193,11 @@ components:
               items: { $ref: '#/components/schemas/Channel' }
     Participant:
       type: object
-      required: [userId, displayName, isManager, joinedAtUtc]
+      required: [userId, displayName, joinedAtUtc]
       properties:
         userId: { type: string, format: uuid }
         displayName: { type: string }
         avatarUrl: { type: string, nullable: true }
-        isManager: { type: boolean }
         joinedAtUtc: { type: string, format: date-time }
     ParticipantPage:
       allOf:
@@ -2689,12 +2705,11 @@ components:
     EventChannelCreated:
       description: 'channel.created | Workspace → Messaging (creates CHANNEL conversation), Search'
       type: object
-      required: [channelId, name, visibility, managerUserId, participantUserIds]
+      required: [channelId, name, visibility, participantUserIds]
       properties:
         channelId: { type: string, format: uuid }
         name: { type: string }
         visibility: { $ref: '#/components/schemas/ChannelVisibility' }
-        managerUserId: { type: string, format: uuid }
         participantUserIds:
           type: array
           items: { type: string, format: uuid }
