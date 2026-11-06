@@ -2687,13 +2687,15 @@ components:
             - $ref: '#/components/schemas/EventPresenceChanged'
             - $ref: '#/components/schemas/EventDocumentAwareness'
     EventUserProfileUpdated:
-      description: 'user.profile-updated | Auth → Messaging, Workspace, Search'
+      description: 'user.profile-updated | Auth → Messaging, Workspace, Search, Collaboration. Also published at registration (profileVersion 1)'
       type: object
-      required: [userId, displayName, avatarVersion]
+      required: [userId, displayName, avatarVersion, profileVersion, email]
       properties:
         userId: { type: string, format: uuid }
         displayName: { type: string }
         avatarVersion: { type: integer, minimum: 0 }
+        email: { type: string, format: email }
+        profileVersion: { type: integer, minimum: 1, description: Increases on every profile change; apply only a higher value. }
     EventMembership:
       description: 'workspace.member-added (→ Messaging, Presence, Search) | workspace.member-removed (→ Messaging, Collaboration, Presence, Search, Notification) | workspace.role-changed (→ Messaging). Producer: Workspace. role omitted on member-removed.'
       type: object
@@ -2741,7 +2743,7 @@ components:
           type: array
           items: { type: string, format: uuid }
     EventMessageCreated:
-      description: 'message.created | Messaging → Messaging live, Search, Notification'
+      description: 'message.created | Messaging → Messaging live, Search, Notification, File'
       allOf:
         - $ref: '#/components/schemas/Message'
         - type: object
